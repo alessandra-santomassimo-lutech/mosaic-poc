@@ -43,6 +43,18 @@ export async function loadBaseImage(url: string): Promise<void> {
   }
 }
 
+/** The loaded image + its contain rect in mosaic UV, or null if not yet loaded. */
+export function getBaseContain(): {
+  img: HTMLImageElement;
+  minX: number;
+  minY: number;
+  spanX: number;
+  spanY: number;
+} | null {
+  if (!baseImg) return null;
+  return { img: baseImg, minX: cMinX, minY: cMinY, spanX: cSpanX, spanY: cSpanY };
+}
+
 /**
  * Paint one chunk of the base image into a canvas.
  * @param uvMinX,uvMinY top-left of the chunk in mosaic UV [0,1]
