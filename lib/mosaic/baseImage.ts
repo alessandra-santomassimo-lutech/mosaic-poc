@@ -1,62 +1,46 @@
-// Procedural "underlying image" generator.
-// The base image is treated as an effectively huge continuous picture; each chunk
-// paints a slice of it. Colours are a pure function of absolute mosaic UV, so
-// neighbouring chunks (and different LODs) line up seamlessly. In production this
-// generator is swapped for a network/CDN tile source — the loader stays identical.
+// Underlying image for the mosaic: mona-lisa.jpg, "contain"-fitted into the
+// square mosaic UV space so its aspect ratio is preserved (dark letterbox on the
+// sides). Each chunk crops the corresponding region of the image, so the chunk
+// pyramid / lazy loading / eviction all keep working unchanged — only the pixels
+// a chunk paints have changed (procedural noise -> real image crop).
 
-const ART = 128; // native pixels per chunk (upsampled on screen)
+const ART = 256; // native pixels per chunk (upsampled on screen)
+const BG = "#05060f";
 
-function hashLattice(ix: number, iy: number): number {
-  let h = (ix * 374761393 + iy * 668265263) >>> 0;
-  h = Math.imul(h ^ (h >>> 13), 1274126177) >>> 0;
-  return ((h ^ (h >>> 16)) >>> 0) / 0xffffffff;
-}
+let baseImg: HTMLImageElement | null = null;
+let imgW = 1;
+let imgH = 1;
 
-function smooth(t: number): number {
-  return t * t * (3 - 2 * t);
-}
+// Content rectangle in mosaic UV [0,1], preserving the image aspect ratio.
+let cMinX = 0;
+let cMinY = 0;
+let cSpanX = 1;
+let cSpanY = 1;
 
-function valueNoise(x: number, y: number): number {
-  const ix = Math.floor(x);
-  const iy = Math.floor(y);
-  const fx = smooth(x - ix);
-  const fy = smooth(y - iy);
-  const a = hashLattice(ix, iy);
-  const b = hashLattice(ix + 1, iy);
-  const c = hashLattice(ix, iy + 1);
-  const d = hashLattice(ix + 1, iy + 1);
-  return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
-}
+/** Load and decode the base image once. Must resolve before chunks generate. */
+export async function loadBaseImage(url: string): Promise<void> {
+  if (baseImg) return;
+  const img = new Image();
+  img.src = url;
+  await img.decode();
+  baseImg = img;
+  imgW = img.naturalWidth;
+  imgH = img.naturalHeight;
 
-function fbm(x: number, y: number): number {
-  let sum = 0;
-  let amp = 0.5;
-  let freq = 1;
-  for (let o = 0; o < 5; o++) {
-    sum += valueNoise(x * freq, y * freq) * amp;
-    freq *= 2.02;
-    amp *= 0.5;
+  const aspect = imgW / imgH;
+  if (aspect >= 1) {
+    // Landscape: full width, letterbox top/bottom.
+    cSpanX = 1;
+    cSpanY = 1 / aspect;
+    cMinX = 0;
+    cMinY = (1 - cSpanY) / 2;
+  } else {
+    // Portrait: full height, letterbox left/right.
+    cSpanX = aspect;
+    cSpanY = 1;
+    cMinX = (1 - cSpanX) / 2;
+    cMinY = 0;
   }
-  return sum;
-}
-
-// Nebula palette: deep space blue -> violet -> cyan/magenta highlights.
-function palette(t: number, out: [number, number, number]): void {
-  const clamped = Math.min(1, Math.max(0, t));
-  // three-stop gradient
-  const stops: [number, number, number][] = [
-    [10, 12, 40], // deep blue-black
-    [70, 40, 130], // violet
-    [90, 200, 235], // cyan
-  ];
-  const seg = clamped * 2;
-  const i = Math.min(1, Math.floor(seg));
-  const f = seg - i;
-  const lo = stops[i];
-  const hi = stops[i + 1];
-  out[0] = lo[0] + (hi[0] - lo[0]) * f;
-  out[1] = lo[1] + (hi[1] - lo[1]) * f;
-  out[2] = lo[2] + (hi[2] - lo[2]) * f;
 }
 
 /**
@@ -69,34 +53,32 @@ export function generateChunkCanvas(uvMinX: number, uvMinY: number, uvSpan: numb
   canvas.width = ART;
   canvas.height = ART;
   const ctx = canvas.getContext("2d")!;
-  const img = ctx.createImageData(ART, ART);
-  const data = img.data;
-  const rgb: [number, number, number] = [0, 0, 0];
+  ctx.fillStyle = BG;
+  ctx.fillRect(0, 0, ART, ART);
 
-  // Field frequency in UV space -> large-scale nebula clouds.
-  const FREQ = 6.0;
+  if (!baseImg) return canvas;
 
-  for (let py = 0; py < ART; py++) {
-    const v = uvMinY + (py / ART) * uvSpan;
-    for (let px = 0; px < ART; px++) {
-      const u = uvMinX + (px / ART) * uvSpan;
+  // Overlap of this chunk's UV rect with the image content rect.
+  const oU0 = Math.max(uvMinX, cMinX);
+  const oU1 = Math.min(uvMinX + uvSpan, cMinX + cSpanX);
+  const oV0 = Math.max(uvMinY, cMinY);
+  const oV1 = Math.min(uvMinY + uvSpan, cMinY + cSpanY);
+  if (oU1 <= oU0 || oV1 <= oV0) return canvas; // fully in the letterbox
 
-      const n = fbm(u * FREQ + 3.1, v * FREQ + 7.7);
-      const swirl = fbm(u * FREQ * 2.3 - 5.0, v * FREQ * 2.3 + 2.0);
-      const t = n * 0.75 + swirl * 0.35;
-      palette(t, rgb);
+  // Source rect in image pixels.
+  const sx = ((oU0 - cMinX) / cSpanX) * imgW;
+  const sy = ((oV0 - cMinY) / cSpanY) * imgH;
+  const sw = ((oU1 - oU0) / cSpanX) * imgW;
+  const sh = ((oV1 - oV0) / cSpanY) * imgH;
 
-      // Sparse bright "stars" from a high-frequency threshold.
-      const star = valueNoise(u * 900 + 0.5, v * 900 + 0.5);
-      const starHit = star > 0.985 ? (star - 0.985) / 0.015 : 0;
+  // Destination rect in the chunk canvas.
+  const dx = ((oU0 - uvMinX) / uvSpan) * ART;
+  const dy = ((oV0 - uvMinY) / uvSpan) * ART;
+  const dw = ((oU1 - oU0) / uvSpan) * ART;
+  const dh = ((oV1 - oV0) / uvSpan) * ART;
 
-      const o = (py * ART + px) * 4;
-      data[o] = Math.min(255, rgb[0] + starHit * 220);
-      data[o + 1] = Math.min(255, rgb[1] + starHit * 220);
-      data[o + 2] = Math.min(255, rgb[2] + starHit * 235);
-      data[o + 3] = 255;
-    }
-  }
-  ctx.putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(baseImg, sx, sy, sw, sh, dx, dy, dw, dh);
   return canvas;
 }

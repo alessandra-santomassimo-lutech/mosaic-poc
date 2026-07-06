@@ -2,6 +2,7 @@
 // (multi-pass: base chunks -> base RenderTexture -> composite -> screen/globe).
 
 import { Application, RenderTexture, Texture } from "pixi.js";
+import { loadBaseImage } from "./baseImage";
 import { ChunkLoader } from "./chunkLoader";
 import { CompositePass } from "./composite";
 import { InputController } from "./input";
@@ -64,6 +65,13 @@ export class MosaicEngine {
     }
     this.app.stop(); // we drive rendering ourselves
     this.container.appendChild(this.app.canvas);
+
+    // Load the underlying image before chunks start painting from it.
+    await loadBaseImage("/mona-lisa.jpg");
+    if (this.disposed) {
+      this.destroyApp();
+      return;
+    }
 
     this.tiles = new TileState();
     this.chunks = new ChunkLoader();
